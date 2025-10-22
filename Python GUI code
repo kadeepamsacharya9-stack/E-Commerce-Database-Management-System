@@ -1,0 +1,319 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import mysql.connector
+
+# --- Database Config ---
+DB_CONFIG = {
+    "user": "root",
+    "password": "27122006",
+    "host": "127.0.0.1",
+    "database": "ecom",
+}
+
+# --- DB Connection ---
+def get_connection():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        return conn
+    except mysql.connector.Error as err:
+        messagebox.showerror("DB Error", str(err))
+        return None
+
+# --- Fetch Products ---
+def fetch_products():
+    conn = get_connection()
+    if not conn:
+        return []
+    cursor = conn.cursor()
+    cursor.execute("SELECT P_ID, Name, Price, Stock FROM Product")
+    products = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return products
+
+# --- Refresh Products Dropdown ---
+def refresh_products():
+    products = fetch_products()
+    combo_products['values'] = [f"{p[0]}: {p[1]} (₹{p[2]}, Stock:{p[3]})" for p in products]
+
+# --- Refresh Cart Table & Total ---
+def refresh_cart():
+    customer_id = entry_cid.get().strip()
+    for item in cart_tree.get_children():
+        cart_tree.delete(item)
+    total_amount.set(0)
+    if not customer_id:
+        return
+    conn = get_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    cursor.execute("SELECT Name, Price, Quantity, Price*Quantity AS Total FROM cart WHERE User_ID=%s", (customer_id,))
+    items = cursor.fetchall()
+    total = 0
+    for row in items:
+        cart_tree.insert("", "end", values=row)
+        total += row[3]
+    total_amount.set(total)
+    cursor.close()
+    conn.close()
+
+# --- Refresh Previous Orders ---
+def refresh_previous_orders():
+    customer_id = entry_cid.get().strip()
+    for item in orders_tree.get_children():
+        orders_tree.delete(item)
+    if not customer_id:
+        return
+    conn = get_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT o.O_ID, p.Name, op.Quantity, p.Price, op.Quantity*p.Price AS Total 
+        FROM Orders o 
+        JOIN Order_Product op ON o.O_ID = op.O_ID 
+        JOIN Product p ON op.P_ID = p.P_ID 
+        WHERE o.C_ID=%s
+        ORDER BY o.O_ID
+    """, (customer_id,))
+    items = cursor.fetchall()
+    for row in items:
+        orders_tree.insert("", "end", values=row)
+    cursor.close()
+    conn.close()
+
+# --- Add to Cart (NO Stock Decrement) ---
+def add_to_cart():
+    customer_id = entry_cid.get().strip()
+    product_selection = combo_products.get()
+    qty = entry_qty.get().strip()
+    
+    if not customer_id or not product_selection or not qty:
+        messagebox.showwarning("Input Error", "Fill all fields!")
+        return
+
+    product_id = product_selection.split(":")[0]
+
+    try:
+        qty = int(qty)
+    except ValueError:
+        messagebox.showwarning("Input Error", "Quantity must be a number!")
+        return
+
+    conn = get_connection()
+    if not conn:
+        return
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Name, Price, Stock, CAT_ID FROM Product WHERE P_ID=%s", (product_id,))
+        product = cursor.fetchone()
+
+        if not product:
+            messagebox.showerror("Error", "Product not found!")
+            return
+
+        name, price, stock, cat_id = product
+
+        if stock < qty:
+            messagebox.showwarning("Stock Error", f"Only {stock} units left in stock!")
+            return
+
+        # Insert into cart only
+        cursor.execute("""
+            INSERT INTO cart (User_ID, P_ID, Name, Price, Quantity, CAT_ID)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (customer_id, product_id, name, price, qty, cat_id))
+
+        conn.commit()
+        messagebox.showinfo("Success", f"Added {qty} x {name} to cart!")
+        refresh_cart()
+        refresh_products()
+
+    except mysql.connector.Error as e:
+        conn.rollback()
+        messagebox.showerror("DB Error", str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- Place Order from Cart (Stock Reduced via Trigger) ---
+def place_order_from_cart():
+    customer_id = entry_cid.get().strip()
+    payment_mode = payment_mode_var.get()
+
+    if not customer_id:
+        messagebox.showwarning("Input Error", "Enter Customer ID!")
+        return
+    if not payment_mode:
+        messagebox.showerror("Payment Error", "Please select a payment mode before placing the order!")
+        return
+
+    conn = get_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT P_ID, Quantity FROM cart WHERE User_ID=%s", (customer_id,))
+        items = cursor.fetchall()
+        if not items:
+            messagebox.showinfo("Info", "Cart is empty!")
+            return
+
+        for item in items:
+            # Your stored procedure handles Orders insertion
+            cursor.callproc("Add_New_Order", (customer_id, item[0], item[1]))
+
+        # Clear cart after order
+        cursor.execute("DELETE FROM cart WHERE User_ID=%s", (customer_id,))
+        conn.commit()
+
+        messagebox.showinfo("Success", f"Order placed successfully using {payment_mode}!")
+        refresh_cart()
+        refresh_products()
+        refresh_previous_orders()
+        payment_mode_var.set("")
+
+    except mysql.connector.Error as e:
+        conn.rollback()
+        messagebox.showerror("DB Error", str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- Clear Cart (Restores Stock) ---
+def clear_cart():
+    customer_id = entry_cid.get().strip()
+    if not customer_id:
+        messagebox.showwarning("Input Error", "Enter Customer ID!")
+        return
+    if messagebox.askyesno("Confirm", "Are you sure you want to clear the cart?"):
+        conn = get_connection()
+        if not conn:
+            return
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT P_ID, Quantity FROM cart WHERE User_ID=%s", (customer_id,))
+            items = cursor.fetchall()
+            for item in items:
+                cursor.execute("UPDATE Product SET Stock = Stock + %s WHERE P_ID=%s", (item[1], item[0]))
+            cursor.execute("DELETE FROM cart WHERE User_ID=%s", (customer_id,))
+            conn.commit()
+            messagebox.showinfo("Success", "Cart cleared successfully!")
+            refresh_cart()
+            refresh_products()
+        except mysql.connector.Error as e:
+            conn.rollback()
+            messagebox.showerror("DB Error", str(e))
+        finally:
+            cursor.close()
+            conn.close()
+
+# --- Main Window ---
+def open_main_window(customer_id):
+    login_window.destroy()
+    global root, entry_cid, combo_products, entry_qty, cart_tree, orders_tree, total_amount, payment_mode_var
+    root = tk.Tk()
+    root.title("E-Commerce App")
+    root.configure(bg="#F7F7F7")
+
+    tk.Label(root, text="Customer ID:", bg="#F7F7F7", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="e")
+    entry_cid = tk.Entry(root)
+    entry_cid.insert(0, customer_id)
+    entry_cid.config(state="readonly")
+    entry_cid.grid(row=0, column=1, padx=10, pady=5)
+
+    tk.Label(root, text="Select Product:", bg="#F7F7F7", font=("Arial", 10, "bold")).grid(row=1, column=0, padx=10, pady=5, sticky="e")
+    combo_products = ttk.Combobox(root, width=50)
+    combo_products.grid(row=1, column=1, padx=10, pady=5)
+
+    tk.Label(root, text="Quantity:", bg="#F7F7F7", font=("Arial", 10, "bold")).grid(row=2, column=0, padx=10, pady=5, sticky="e")
+    entry_qty = tk.Entry(root)
+    entry_qty.grid(row=2, column=1, padx=10, pady=5)
+
+    tk.Label(root, text="Payment Mode:", bg="#F7F7F7", font=("Arial", 10, "bold")).grid(row=3, column=0, padx=10, pady=5, sticky="e")
+    payment_mode_var = tk.StringVar()
+    combo_payment = ttk.Combobox(root, textvariable=payment_mode_var, width=25, state="readonly")
+    combo_payment['values'] = ("COD", "Netbanking", "Credit/Debit Card")
+    combo_payment.grid(row=3, column=1, padx=10, pady=5)
+    combo_payment.set("")
+
+    btn_add_cart = tk.Button(root, text="Add to Cart", bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), command=add_to_cart)
+    btn_add_cart.grid(row=4, column=0, pady=10)
+    btn_place_order = tk.Button(root, text="Place Order", bg="#2196F3", fg="white", font=("Arial", 10, "bold"), command=place_order_from_cart)
+    btn_place_order.grid(row=4, column=1, pady=10)
+    btn_clear_cart = tk.Button(root, text="Clear Cart", bg="#F44336", fg="white", font=("Arial", 10, "bold"), command=clear_cart)
+    btn_clear_cart.grid(row=4, column=2, pady=10, padx=10)
+
+    cart_tree = ttk.Treeview(root, columns=("Name", "Price", "Quantity", "Total"), show="headings", height=10)
+    for col in ("Name", "Price", "Quantity", "Total"):
+        cart_tree.heading(col, text=col)
+    cart_tree.grid(row=5, column=0, columnspan=3, padx=10, pady=10)
+
+    total_amount = tk.DoubleVar(value=0)
+    tk.Label(root, text="Total Amount:", bg="#F7F7F7", font=("Arial", 10, "bold")).grid(row=6, column=0, sticky="e")
+    tk.Label(root, textvariable=total_amount, bg="#F7F7F7", font=("Arial", 10, "bold"), fg="#333").grid(row=6, column=1, sticky="w")
+
+    tk.Label(root, text="Previous Orders:", bg="#F7F7F7", font=("Arial", 10, "bold")).grid(row=7, column=0, columnspan=3, pady=(10,0))
+    orders_tree = ttk.Treeview(root, columns=("OrderID", "Product", "Quantity", "Price", "Total"), show="headings", height=10)
+    for col in ("OrderID", "Product", "Quantity", "Price", "Total"):
+        orders_tree.heading(col, text=col)
+    orders_tree.grid(row=8, column=0, columnspan=3, padx=10, pady=10)
+
+    refresh_products()
+    refresh_cart()
+    refresh_previous_orders()
+    root.mainloop()
+
+# --- Login User ---
+def login_user():
+    cid = entry_login_cid.get().strip()
+    pwd = entry_login_pwd.get().strip()
+    if not cid or not pwd:
+        messagebox.showwarning("Input Error", "Enter both Customer ID and Password!")
+        return
+
+    conn = get_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM customer WHERE ID=%s AND Password=%s", (cid, pwd))
+        user = cursor.fetchone()
+        if user:
+            messagebox.showinfo("Login Successful", f"Welcome, {cid}!")
+            open_main_window(cid)
+        else:
+            messagebox.showerror("Login Failed", "Invalid ID or Password!")
+    except mysql.connector.Error as e:
+        messagebox.showerror("DB Error", str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- Login UI ---
+login_window = tk.Tk()
+login_window.title("E-Commerce Login")
+login_window.geometry("450x320")
+login_window.configure(bg="#222831")
+
+frame = tk.Frame(login_window, bg="#393E46", bd=2, relief="ridge")
+frame.place(relx=0.5, rely=0.5, anchor="center", width=350, height=240)
+
+tk.Label(frame, text="🛒 Welcome to E-Shop", bg="#393E46", fg="#FFD369", font=("Arial Rounded MT Bold", 16)).pack(pady=15)
+
+tk.Label(frame, text="Customer ID:", bg="#393E46", fg="white", font=("Arial", 10)).pack(pady=5)
+entry_login_cid = tk.Entry(frame, font=("Arial", 10))
+entry_login_cid.pack(pady=5, ipadx=20)
+
+tk.Label(frame, text="Password:", bg="#393E46", fg="white", font=("Arial", 10)).pack(pady=5)
+entry_login_pwd = tk.Entry(frame, show="*", font=("Arial", 10))
+entry_login_pwd.pack(pady=5, ipadx=20)
+
+btn_login = tk.Button(frame, text="Login", bg="#FFD369", fg="#222831", font=("Arial", 10, "bold"), width=15, command=login_user)
+btn_login.pack(pady=15)
+
+tk.Label(login_window, text="© 2025 E-Shop by Deepam", bg="#222831", fg="#AAAAAA", font=("Arial", 8)).pack(side="bottom", pady=5)
+
+login_window.mainloop()
